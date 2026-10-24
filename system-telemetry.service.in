@@ -1,0 +1,17 @@
+[Unit]
+Description=System telemetry logger
+After=systemd-modules-load.service
+Wants=systemd-modules-load.service
+
+[Service]
+Type=simple
+User=@USER@
+SupplementaryGroups=systemd-journal
+Environment=HOME="@HOME@"
+WorkingDirectory="@INSTALL_DIR@"
+ExecStart="@INSTALL_DIR@/system-telemetry.sh" --headless
+Restart=on-failure
+RestartSec=5
+
+[Install]
+WantedBy=multi-user.target
