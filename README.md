@@ -78,7 +78,7 @@ Then restart journald with `sudo systemctl restart systemd-journald`.
 
 When the GPU drops off the bus the screen goes black, but Linux keeps running. Holding the power button skips the clean shutdown and can damage the filesystem. Instead, hold **Super + Alt + Delete for 3 seconds**:
 
-1. Caps Lock blinks three times to confirm.
+1. Caps Lock blinks five times (about 3 seconds) to confirm.
 2. The kernel log is saved into this boot's crash bundle as `kernel-at-reboot.log`.
 3. Disks are synced and the machine reboots cleanly.
 4. If the clean reboot hangs for 45 seconds (unloading the NVIDIA driver can block on a dead GPU), it is forced through `/proc/sysrq-trigger`: sync, remount read-only, reboot.

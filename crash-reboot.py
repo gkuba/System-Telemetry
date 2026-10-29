@@ -118,8 +118,11 @@ class Watcher:
             elif time.monotonic() - self.held_since >= HOLD_SECONDS:
                 return
 
-    def blink(self, times=3):
-        """Flash Caps Lock: the only feedback possible with a black screen."""
+    def blink(self, times=5, interval=0.3):
+        """Flash Caps Lock: the only feedback possible with a black screen.
+
+        Slow enough to notice while still holding the keys (about 3 seconds).
+        """
         leds = []
         for device in self.devices.values():
             try:
@@ -134,7 +137,7 @@ class Watcher:
                         device.set_led(e.LED_CAPSL, state)
                     except OSError:
                         pass
-                time.sleep(0.15)
+                time.sleep(interval)
         for device, was_on in leds:
             try:
                 device.set_led(e.LED_CAPSL, int(was_on))
