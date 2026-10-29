@@ -1,43 +1,82 @@
 # System Telemetry
 
-A small Linux telemetry logger for diagnosing GPU crashes, PCIe faults, and storage issues.
+A Linux logger for chasing an NVIDIA GPU that drops off the bus (black screen, fans at 100%). It samples the GPU every 2 seconds, watches the kernel log for driver failures, and saves a crash bundle the moment the GPU is lost, so every failure leaves evidence behind.
 
 ## What it records
 
-- GPU power, load, temperature, clocks, fan, VRAM, and PCIe link status
-- Board 12 V and VRM MOS temperature, when available
-- GPU and NVMe PCIe link speed, width, and AER error counters
-- Kernel warnings related to GPU, PCIe, NVMe, storage, and early boot
-- Board, BIOS, and kernel version at logger startup
+- **GPU samples** (`logs/telemetry.csv`): P-state, power and limit, load, temperature, clocks, PCIe link, VRAM use, fan, and the active clock-limit reasons (idle, power cap, thermal, power brake).
+- **VRAM health** (`logs/health.csv`): remapped-row counts and the bank-availability histogram at every start and hourly, plus driver, VBIOS and ECC mode. A rise in remapped rows is recorded as an alert; it is the clearest hardware evidence the card can give.
+- **Events** (`logs/events.log`): logger starts, every NVIDIA Xid, the first occurrence of each other NVRM/PCIe/AER kernel message (repeats are counted, not copied), GPU lost and recovered, and new kernel panic dumps in `/var/lib/systemd/pstore`.
+- **Crash bundles** (`logs/crashes/<time>/`): written when the driver reports a GPU failure (Xid 79, 119, 48 and similar, scrub timeouts, "fallen off the bus") or `nvidia-smi` stops answering. Bundles are never rotated away.
 
-NVMe SMART data is not collected by the service because it lacks device permissions. Gather it manually when needed with `sudo smartctl -x /dev/nvme0` and the relevant device path.
+Each bundle holds:
+
+| File | Contents |
+| --- | --- |
+| `summary.txt` | Trigger, first error line, boot ID, kernel, board, BIOS, microcode, last VRAM health snapshot |
+| `telemetry.csv` | The last ~10 minutes of samples before the failure |
+| `kernel.log` | Kernel log from 15 minutes before the failure, recaptured 90 seconds after it |
+| `pci.txt`, `pci-after.txt` | PCIe link and AER counters for the GPU and its root port, at the failure and 90 seconds later |
+| `nvidia-smi-q.txt` | Full `nvidia-smi -q`, if the GPU still answered |
+| `kernel-previous-boot.log` | Added at the next start when the failure ended the boot |
+
+If the logger misses a failure live (it was not running, or the machine froze), the next start finds it in the previous boot's journal and builds a bundle from the journal and the saved samples.
+
+## Requirements
+
+- Bash 5 and an NVIDIA GPU with the NVIDIA driver (`nvidia-smi`)
+- coreutils (`timeout`, `stat`), util-linux (`flock`), procps (`pkill`), and `journalctl`
+- Read access to the kernel journal: the service gets it through the `systemd-journal` group
+
+## Files
+
+| File | Purpose |
+| --- | --- |
+| `system-telemetry.sh` | The logger and dashboard |
+| `install-service.sh` | Generates the unit from the template and installs, enables and restarts it |
+| `system-telemetry.service.in` | Unit template; `@USER@`, `@HOME@` and `@INSTALL_DIR@` are filled in by the installer |
 
 ## Run
 
-Run the logger with its dashboard in a terminal:
+Run the logger with its dashboard:
 
 ```bash
 ./system-telemetry.sh
 ```
 
-The default mode checks whether a logger is already running. If one is, another launch opens a read-only dashboard using the active logs; it does not start a second logger or overwrite its data.
+If a logger is already running (for example the service), this opens a read-only dashboard of its data instead of starting a second logger.
 
-Run without drawing a dashboard (used by the system service):
+Run without the dashboard (used by the service):
 
 ```bash
 ./system-telemetry.sh --headless
 ```
 
-`--no-display` is an alias for `--headless`.
-
-The service installer creates a local systemd unit for the current user and checkout path, then enables and starts it. Run it from any location:
+Install it as a system service for the current user and checkout path:
 
 ```bash
 ./install-service.sh
 ```
 
-The installer asks for sudo access to install the unit. It reads `system-telemetry.service.in`; the generated, machine-specific unit is installed under `/etc/systemd/system/` and is not stored in the repository.
+The installer asks for sudo, writes the unit to `/etc/systemd/system/`, and enables and restarts it. The unit runs the script from this checkout, so run the installer again whenever the folder moves or is renamed.
 
-## Logs
+Check on the service with `systemctl status system-telemetry` and `journalctl -u system-telemetry`.
 
-Logs are written to `logs/` beside the script. They rotate automatically; `/logs/` is ignored by Git so generated telemetry is not committed.
+## Keep the journal
+
+The previous-boot check can only read what journald kept. With a small journal cap, older boots are deleted within days. Raise the cap in `/etc/systemd/journald.conf`:
+
+```ini
+[Journal]
+SystemMaxUse=1G
+```
+
+Then restart journald with `sudo systemctl restart systemd-journald`.
+
+## After a crash
+
+1. Reboot and let the service start; it adds the previous boot's kernel log to the bundle.
+2. Run `sudo nvidia-bug-report.sh` and keep the archive with the bundle.
+3. Compare the newest row of `logs/health.csv` with older rows to see whether remapped rows went up.
+
+Logs are written to `logs/` beside the script, and `/logs/` is ignored by Git. Set `TELEMETRY_LOG_DIR` to log somewhere else.

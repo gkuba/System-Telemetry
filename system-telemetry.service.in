@@ -8,7 +8,7 @@ Type=simple
 User=@USER@
 SupplementaryGroups=systemd-journal
 Environment=HOME="@HOME@"
-WorkingDirectory="@INSTALL_DIR@"
+WorkingDirectory=@INSTALL_DIR@
 ExecStart="@INSTALL_DIR@/system-telemetry.sh" --headless
 Restart=on-failure
 RestartSec=5

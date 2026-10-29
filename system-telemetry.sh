@@ -1,806 +1,666 @@
 #!/usr/bin/env bash
+#
+# System Telemetry: logs NVIDIA GPU state and saves a crash bundle whenever the
+# driver loses the GPU, so every black-screen event leaves evidence behind.
 
 set -uo pipefail
+shopt -s extglob nullglob
 export LC_ALL=C
+
+usage() {
+    printf 'Usage: %s [--headless]\n' "${0##*/}"
+    printf 'Log GPU telemetry and save a crash bundle when the GPU stops answering.\n'
+    printf 'If a logger is already running, this opens a read-only dashboard instead.\n'
+}
 
 DISPLAY_MODE=1
 case "${1:-}" in
     '') ;;
     --headless|--no-display) DISPLAY_MODE=0 ;;
-    -h|--help)
-        printf 'Usage: %s [--headless]\n' "${0##*/}"
-        printf 'Run the telemetry logger without drawing the interactive dashboard.\n'
-        exit 0
-        ;;
-    *)
-        printf 'Usage: %s [--headless]\n' "${0##*/}" >&2
-        exit 2
-        ;;
+    -h|--help) usage; exit 0 ;;
+    *) usage >&2; exit 2 ;;
 esac
-if (( $# > 1 )); then
-    printf 'Usage: %s [--headless]\n' "${0##*/}" >&2
-    exit 2
-fi
+(( $# <= 1 )) || { usage >&2; exit 2; }
 
 SCRIPT_DIR="$(cd -- "$(dirname -- "${BASH_SOURCE[0]}")" && pwd)"
-LOG_DIR="$SCRIPT_DIR/logs"
-LOG_FILE="$LOG_DIR/gpu-telemetry.csv"
-EXTENDED_LOG="$LOG_DIR/gpu-telemetry-extended.csv"
-PLATFORM_LOG="$LOG_DIR/platform-telemetry.csv"
-KERNEL_LOG="$LOG_DIR/kernel-events.log"
-STORAGE_LOG="$LOG_DIR/storage-events.log"
-ALERT_FILE="$LOG_DIR/.gpu-telemetry-alert"
-LOG_MAX_BYTES=$((10 * 1024 * 1024))
-LOG_ROTATIONS=3
-STORAGE_LOG_MAX_BYTES=$((10 * 1024 * 1024 / 4))
-STORAGE_LOG_ROTATIONS=3
-HISTORY_LIMIT=10
-FRAME_WIDTH=96
-LEFT_PADDING=2
+LOG_DIR="${TELEMETRY_LOG_DIR:-$SCRIPT_DIR/logs}"
+TELEMETRY_CSV="$LOG_DIR/telemetry.csv"
+HEALTH_CSV="$LOG_DIR/health.csv"
+EVENTS_LOG="$LOG_DIR/events.log"
+CRASH_DIR="$LOG_DIR/crashes"
+ALERT_FILE="$LOG_DIR/.alert"
+SEEN_BOOTS="$LOG_DIR/.seen-boots"
+SEEN_PSTORE="$LOG_DIR/.seen-pstore"
+LOCK_FILE="$LOG_DIR/.logger.lock"
+PSTORE_DIR=/var/lib/systemd/pstore
+
 SAMPLE_INTERVAL=2
 QUERY_TIMEOUT=4
-CSV_HEADER='status,timestamp,gpu,pstate,power_w,utilization_pct,temperature_c,graphics_clock_mhz,memory_clock_mhz,pcie_gen,pcie_width,detail'
-EXTENDED_HEADER='timestamp,memory_used_mib,memory_total_mib,memory_temperature_c,fan_speed_pct,power_limit_w,pcie_rx_kib_s,pcie_tx_kib_s'
-PLATFORM_HEADER='timestamp,board_12v_v,vrm_mos_c,gpu_bdf,gpu_link_speed,gpu_link_width,gpu_aer_correctable,gpu_aer_nonfatal,gpu_aer_fatal,upstream_bdf,upstream_link_speed,upstream_link_width,upstream_aer_correctable,upstream_aer_nonfatal,upstream_aer_fatal'
+HEALTH_INTERVAL=3600         # remapped rows only change after a GPU reset, so hourly is plenty
+LOST_ROW_INTERVAL=60         # while the GPU is gone, log one LOST row a minute instead of every sample
+BUNDLE_COOLDOWN=1800         # one crash bundle per failure, not one per error line
+BUNDLE_SAMPLES=300           # about 10 minutes of samples before the failure
+BUNDLE_KERNEL_LOOKBACK=900   # kernel log from 15 minutes before the failure
+FOLLOWUP_DELAY=90            # recapture the kernel log once the error storm has played out
+REPEAT_LOG_EVERY=500         # repeated kernel messages are logged once, then every Nth time
+TELEMETRY_MAX_BYTES=$((20 * 1024 * 1024))
+TELEMETRY_ROTATIONS=2
+EVENTS_MAX_BYTES=$((5 * 1024 * 1024))
+EVENTS_ROTATIONS=2
+HISTORY_LIMIT=10
+FRAME_WIDTH=96
+
+# Xids that mean the GPU itself failed (memory, firmware, bus), not an application fault.
+TRIGGER_RE='Xid \([^)]*\): (48|61|62|63|64|74|79|92|94|95|119|120|140|154)([^0-9]|$)|fallen off the bus|API_GPU_ATTACHED_SANITY_CHECK|_scrubWaitAndSave: Timed out|RmInitAdapter failed|AER: (Uncorrect|.*[Ff]atal)'
+KERNEL_FILTER='NVRM|nvidia|Xid|pcieport|AER|fallen off'
+
+QUERY_FIELDS=(pstate power.draw power.limit utilization.gpu utilization.memory temperature.gpu
+    temperature.memory clocks.current.graphics clocks.current.memory pcie.link.gen.current
+    pcie.link.width.current memory.used memory.total fan.speed clocks_event_reasons.active)
+TELEMETRY_HEADER='timestamp,status,pstate,power_w,power_limit_w,gpu_util_pct,mem_util_pct,temp_c,mem_temp_c,gfx_mhz,mem_mhz,pcie_gen,pcie_width,vram_used_mib,vram_total_mib,fan_pct,clock_reasons,detail'
+HEALTH_HEADER='timestamp,boot_id,reason,gpu_name,driver,vbios,ecc_mode,persistence,remap_correctable,remap_uncorrectable,remap_pending,remap_failure,hist_max,hist_high,hist_partial,hist_low,hist_none'
 
 if [[ -r "$HOME/.shell_colors" ]]; then
     # User color definitions are Bash-compatible ANSI assignments.
     source "$HOME/.shell_colors"
 fi
-
-RESET="${ENDCOLOR:-$'\033[0m'}"
-PURPLE="${DRACULA_PURPLE:-$'\033[38;5;141m'}"
-PINK="${DRACULA_PINK:-$'\033[38;5;212m'}"
-CYAN="${DRACULA_CYAN:-$'\033[38;5;87m'}"
-GREEN="${DRACULA_GREEN:-$'\033[38;5;84m'}"
-YELLOW="${DRACULA_YELLOW:-$'\033[38;5;228m'}"
-RED="${DRACULA_RED:-$'\033[38;5;203m'}"
-FOREGROUND="${DRACULA_FOREGROUND:-$'\033[38;5;253m'}"
-COMMENT="${DRACULA_COMMENT:-$'\033[38;5;60m'}"
-
+RESET="${ENDCOLOR:-$'\e[0m'}"
+PURPLE="${DRACULA_PURPLE:-$'\e[38;5;141m'}"
+PINK="${DRACULA_PINK:-$'\e[38;5;212m'}"
+CYAN="${DRACULA_CYAN:-$'\e[38;5;87m'}"
+GREEN="${DRACULA_GREEN:-$'\e[38;5;84m'}"
+YELLOW="${DRACULA_YELLOW:-$'\e[38;5;228m'}"
+RED="${DRACULA_RED:-$'\e[38;5;203m'}"
+FOREGROUND="${DRACULA_FOREGROUND:-$'\e[38;5;253m'}"
+COMMENT="${DRACULA_COMMENT:-$'\e[38;5;60m'}"
 if [[ ! -t 1 || -n "${NO_COLOR:-}" ]]; then
-    RESET=''
-    PURPLE=''
-    PINK=''
-    CYAN=''
-    GREEN=''
-    YELLOW=''
-    RED=''
-    FOREGROUND=''
-    COMMENT=''
+    RESET='' PURPLE='' PINK='' CYAN='' GREEN='' YELLOW='' RED='' FOREGROUND='' COMMENT=''
 fi
 
-if ! command -v timeout >/dev/null 2>&1; then
-    printf 'Error: timeout (from coreutils) was not found.\n' >&2
-    exit 1
-fi
-if ! command -v stat >/dev/null 2>&1; then
-    printf 'Error: stat (from coreutils) was not found.\n' >&2
-    exit 1
-fi
-if ! command -v flock >/dev/null 2>&1; then
-    printf 'Error: flock (from util-linux) was not found.\n' >&2
-    exit 1
-fi
+for tool in timeout flock stat; do
+    command -v "$tool" >/dev/null 2>&1 || { printf 'Error: %s was not found.\n' "$tool" >&2; exit 1; }
+done
+mkdir -p -- "$CRASH_DIR" || { printf 'Error: could not create %s\n' "$CRASH_DIR" >&2; exit 1; }
+exec {LOCK_FD}>>"$LOCK_FILE" || { printf 'Error: could not open %s\n' "$LOCK_FILE" >&2; exit 1; }
+LOGGER_OWNER=0
+flock -n "$LOCK_FD" && LOGGER_OWNER=1
 
-mkdir -p -- "$LOG_DIR" || {
-    printf 'Error: could not create log directory: %s\n' "$LOG_DIR" >&2
-    exit 1
-}
-
-LOCK_FILE="$LOG_DIR/.gpu-telemetry.lock"
-exec {LOCK_FD}>>"$LOCK_FILE" || {
-    printf 'Error: could not open telemetry lock file: %s\n' "$LOCK_FILE" >&2
-    exit 1
-}
-if flock -n "$LOCK_FD"; then
-    LOGGER_OWNER=1
-else
-    LOGGER_OWNER=0
-fi
-READ_ONLY_VIEW=0
-
-PAD="$(printf '%*s' "$LEFT_PADDING" '')"
-COL_WIDTHS=(8 5 8 4 5 12 5 12 9 7 9)
-TABLE_HEADERS=(TIME STATE PWR/LIM GPU TEMP 'VRAM MiB' FAN% GFX/MEM PCIe 12V 'VRM MOS')
-
+BOOT_ID="$(</proc/sys/kernel/random/boot_id)"
+BOOT_ID="${BOOT_ID//-/}"   # journald writes boot IDs without dashes
+NOW=''
 GPU_SYSFS=''
-GPU_BDF=''
 UPSTREAM_SYSFS=''
-UPSTREAM_BDF=''
-if (( LOGGER_OWNER )); then
-    for pci_path in /sys/bus/pci/devices/*; do
-        [[ -r "$pci_path/vendor" && -r "$pci_path/class" ]] || continue
-        if [[ "$(<"$pci_path/vendor")" == '0x10de' && "$(<"$pci_path/class")" == '0x030000' ]]; then
-            GPU_SYSFS="$pci_path"
-            break
-        fi
-    done
-    GPU_BDF="${GPU_SYSFS##*/}"
-    if [[ -n "$GPU_SYSFS" ]]; then
-        resolved_gpu_path="$(readlink -f -- "$GPU_SYSFS" 2>/dev/null || true)"
-        if [[ -n "$resolved_gpu_path" ]]; then
-            UPSTREAM_SYSFS="$(dirname -- "$resolved_gpu_path")"
-        fi
-    fi
-    UPSTREAM_BDF="${UPSTREAM_SYSFS##*/}"
-fi
+QUERY_LIST=''
+FIELD_SUPPORTED=()
+KWATCH_FD=''
+KWATCH_CHILD=''
+KWATCH_RETRY_AT=0
+declare -A KERNEL_SEEN=()
+GPU_LOST=0
+SAMPLE_FAILS=0
+LAST_LOST_ROW=0
+LAST_BUNDLE_EPOCH=0
+BUNDLE_DIR=''
+BUNDLE_EPOCH=0
+FOLLOWUP_AT=0
 
-OPTIONAL_FIELDS=()
-optional_candidates=(memory.used memory.total temperature.memory fan.speed power.limit pcie.rx_throughput pcie.tx_throughput)
-if (( LOGGER_OWNER )); then
-    query_help="$(timeout 2s nvidia-smi --help-query-gpu 2>/dev/null || true)"
-    for field in "${optional_candidates[@]}"; do
-        escaped_field="${field//./\\.}"
-        if [[ "$query_help" =~ (^|[^[:alnum:]_.])${escaped_field}([^[:alnum:]_.]|$) ]]; then
-            OPTIONAL_FIELDS+=("$field")
-        fi
-    done
-fi
+# ---------------------------------------------------------------- logging
 
-KERNEL_FD=''
-KERNEL_JOURNAL_PID=''
-LAST_STORAGE_CAPTURE=0
-NVME_CAPTURE_PID=''
+stamp() { printf -v NOW '%(%FT%T%z)T' -1; }
+epoch_now() { printf -v EPOCH '%(%s)T' -1; }
 
-trim() {
-    local value="$1"
-    value="${value#"${value%%[![:space:]]*}"}"
-    value="${value%"${value##*[![:space:]]}"}"
-    printf '%s' "$value"
+clean_value() { # raw -> CLEAN, trimmed, with nvidia-smi placeholders emptied
+    local v="${1##+([[:space:]])}"
+    v="${v%%+([[:space:]])}"
+    [[ "$v" == ?(\[)@(N/A|Not Supported|Unknown Error)?(\]) ]] && v=''
+    CLEAN="$v"
 }
 
-rotate_file_if_needed() {
-    local file="$1" header="$2" row_bytes="$3" max_bytes="${4:-$LOG_MAX_BYTES}"
-    local rotations="${5:-$LOG_ROTATIONS}" current_size=0 i
-    [[ -f "$file" ]] && current_size="$(stat -c '%s' -- "$file")"
+rotate_if_needed() { # file max-bytes rotations [header]
+    local file="$1" max="$2" rotations="$3" header="${4:-}" size i
+    [[ -f "$file" ]] || return 0
+    size="$(stat -c %s -- "$file")" || return 0
+    (( size >= max )) || return 0
+    rm -f -- "$file.$rotations"
+    for ((i = rotations - 1; i >= 1; i--)); do
+        [[ -f "$file.$i" ]] && mv -- "$file.$i" "$file.$((i + 1))"
+    done
+    mv -- "$file" "$file.1"
+    [[ -z "$header" ]] || printf '%s\n' "$header" > "$file"
+}
 
-    if (( current_size + row_bytes > max_bytes )); then
-        rm -f -- "$file.$rotations"
-        for ((i = rotations - 1; i >= 1; i--)); do
-            if [[ -f "$file.$i" ]]; then
-                mv -- "$file.$i" "$file.$((i + 1))"
-            fi
+log_event() { # tag text
+    stamp
+    printf '[%s] [%s] %s\n' "$NOW" "$1" "$2" >> "$EVENTS_LOG"
+}
+
+set_alert() { # level(ok|warn|bad) text; shared with read-only dashboards through ALERT_FILE
+    printf '%s|%s\n' "$1" "$2" > "$ALERT_FILE"
+}
+
+# ---------------------------------------------------------------- system state
+
+find_gpu() {
+    local dev resolved
+    for dev in /sys/bus/pci/devices/*; do
+        [[ -r "$dev/vendor" && -r "$dev/class" ]] || continue
+        if [[ "$(<"$dev/vendor")" == 0x10de && "$(<"$dev/class")" == 0x030000 ]]; then
+            GPU_SYSFS="$dev"
+            resolved="$(readlink -f -- "$dev")"
+            UPSTREAM_SYSFS="${resolved%/*}"
+            KERNEL_FILTER+="|${dev##*/}"
+            return 0
+        fi
+    done
+}
+
+detect_query_fields() {
+    local help field i
+    local -a used=()
+    help="$(timeout 5s nvidia-smi --help-query-gpu 2>/dev/null)"
+    for i in "${!QUERY_FIELDS[@]}"; do
+        field="${QUERY_FIELDS[i]}"
+        # Older drivers call the clock reasons "throttle" reasons.
+        if [[ "$field" == clocks_event_reasons.active && "$help" != *"\"$field\""* ]]; then
+            field=clocks_throttle_reasons.active
+        fi
+        if [[ "$help" == *"\"$field\""* ]]; then
+            FIELD_SUPPORTED[i]=1
+            used+=("$field")
+        else
+            FIELD_SUPPORTED[i]=0
+        fi
+    done
+    QUERY_LIST="$(IFS=,; printf '%s' "${used[*]}")"
+}
+
+system_identity() {
+    local board bios microcode
+    board="$(cat /sys/class/dmi/id/board_name 2>/dev/null)"
+    bios="$(cat /sys/class/dmi/id/bios_version 2>/dev/null) ($(cat /sys/class/dmi/id/bios_date 2>/dev/null))"
+    microcode="$(grep -m1 '^microcode' /proc/cpuinfo 2>/dev/null)"
+    printf 'boot=%s kernel=%s board=%s bios=%s microcode=%s' \
+        "${BOOT_ID:0:8}" "$(uname -r)" "${board:-?}" "$bios" "${microcode##*: }"
+}
+
+write_pci_state() { # file
+    local dev f
+    {
+        for dev in "$GPU_SYSFS" "$UPSTREAM_SYSFS"; do
+            [[ -n "$dev" ]] || continue
+            printf '== %s\n' "${dev##*/}"
+            for f in current_link_speed current_link_width max_link_speed max_link_width power_state \
+                aer_dev_correctable aer_dev_nonfatal aer_dev_fatal; do
+                [[ -r "$dev/$f" ]] && printf '%s: %s\n' "$f" "$(tr '\n' ' ' < "$dev/$f")"
+            done
         done
-        mv -- "$file" "$file.1"
-        printf '%s\n' "$header" > "$file"
-    fi
+    } > "$1" 2>&1
 }
 
-append_log_row() {
-    local row="$1" row_bytes
-    row_bytes="$(printf '%s\n' "$row" | wc -c)"
-    row_bytes="${row_bytes//[[:space:]]/}"
-    rotate_file_if_needed "$LOG_FILE" "$CSV_HEADER" "$row_bytes"
-    printf '%s\n' "$row" >> "$LOG_FILE"
-}
-
-append_extended_row() {
-    local row="$1" row_bytes
-    row_bytes="$(printf '%s\n' "$row" | wc -c)"
-    row_bytes="${row_bytes//[[:space:]]/}"
-    rotate_file_if_needed "$EXTENDED_LOG" "$EXTENDED_HEADER" "$row_bytes"
-    printf '%s\n' "$row" >> "$EXTENDED_LOG"
-}
-
-append_platform_row() {
-    local row="$1" row_bytes
-    row_bytes="$(printf '%s\n' "$row" | wc -c)"
-    row_bytes="${row_bytes//[[:space:]]/}"
-    rotate_file_if_needed "$PLATFORM_LOG" "$PLATFORM_HEADER" "$row_bytes"
-    printf '%s\n' "$row" >> "$PLATFORM_LOG"
-}
-
-append_storage_event() {
-    local line="$1" row_bytes storage_lock_fd
-    exec {storage_lock_fd}>>"$LOG_DIR/.storage-events.lock" || return 1
-    flock -x "$storage_lock_fd" || {
-        exec {storage_lock_fd}>&-
+take_health_snapshot() { # reason
+    local reason="$1" info remap row last ru_old rc_old ru rc rp rf
+    info="$(timeout 10s nvidia-smi --format=csv,noheader \
+        --query-gpu=name,driver_version,vbios_version,ecc.mode.current,persistence_mode 2>/dev/null)" || {
+        log_event health "snapshot ($reason) skipped: GPU did not answer"
         return 1
     }
-    if [[ ! -e "$STORAGE_LOG" ]]; then
-        printf '%s\n' '===== NVME / STORAGE / PCIe EVENTS =====' > "$STORAGE_LOG"
-    fi
-    row_bytes="$(printf '%s\n' "$line" | wc -c)"
-    row_bytes="${row_bytes//[[:space:]]/}"
-    rotate_file_if_needed "$STORAGE_LOG" '===== NVME / STORAGE / PCIe EVENTS =====' \
-        "$row_bytes" "$STORAGE_LOG_MAX_BYTES" "$STORAGE_LOG_ROTATIONS"
-    printf '%s\n' "$line" >> "$STORAGE_LOG"
-    flock -u "$storage_lock_fd"
-    exec {storage_lock_fd}>&-
-}
+    remap="$(timeout 10s nvidia-smi --format=csv,noheader \
+        --query-remapped-rows=remapped_rows.correctable,remapped_rows.uncorrectable,remapped_rows.pending,remapped_rows.failure,remapped_rows.histogram.max,remapped_rows.histogram.high,remapped_rows.histogram.partial,remapped_rows.histogram.low,remapped_rows.histogram.none \
+        2>/dev/null)" || remap=',,,,,,,,'
+    stamp
+    row="$NOW,$BOOT_ID,$reason,${info//, /,},${remap//, /,}"
+    [[ -s "$HEALTH_CSV" ]] || printf '%s\n' "$HEALTH_HEADER" > "$HEALTH_CSV"
+    last="$(tail -n 1 -- "$HEALTH_CSV")"
+    printf '%s\n' "$row" >> "$HEALTH_CSV"
 
-read_pci_value() {
-    local file="$1"
-    if [[ -r "$file" ]]; then
-        tr '\n' ' ' < "$file" | sed 's/[[:space:]]*$//'
-    else
-        printf 'N/A'
-    fi
-}
-
-read_aer_total() {
-    local file="$1" key="$2"
-    if [[ -r "$file" ]]; then
-        awk -v key="$key" '$1 == key { print $2; found=1 } END { if (!found) print "N/A" }' "$file"
-    else
-        printf 'N/A'
+    IFS=, read -r _ _ _ _ _ _ _ _ rc ru rp rf _ <<< "$row"
+    IFS=, read -r _ _ _ _ _ _ _ _ rc_old ru_old _ <<< "$last"
+    if [[ "$ru_old" =~ ^[0-9]+$ && "$ru" =~ ^[0-9]+$ && "$rc_old" =~ ^[0-9]+$ && "$rc" =~ ^[0-9]+$ ]] &&
+        (( ru > ru_old || rc > rc_old )); then
+        log_event health "VRAM remapped rows went up: uncorrectable $ru_old -> $ru, correctable $rc_old -> $rc"
+        set_alert bad "VRAM remapped rows went up: uncorrectable $ru_old -> $ru (see health.csv)"
+    elif [[ "$rf" == Yes ]]; then
+        set_alert bad 'VRAM row remapping FAILED: the card is out of spare rows'
+    elif [[ "$rp" == Yes ]]; then
+        set_alert warn 'VRAM row remap pending: it takes effect after the next GPU reset'
     fi
 }
 
-capture_platform_metrics() {
-    local timestamp="$1" sensor_values
-    local gpu_speed gpu_width gpu_cor gpu_nonfatal gpu_fatal
-    local upstream_speed upstream_width upstream_cor upstream_nonfatal upstream_fatal
-
-    BOARD_12V='N/A'
-    BOARD_VRM='N/A'
-    if command -v sensors >/dev/null 2>&1; then
-        sensor_values="$(timeout 2s sensors 2>/dev/null | awk '
-            /^[[:space:]]*\+12V:/ { v12=$2; gsub(/[^0-9.]/, "", v12) }
-            /^[[:space:]]*VRM MOS:/ { vrm=$3; gsub(/[^0-9.]/, "", vrm) }
-            END { printf "%s,%s\n", v12 == "" ? "N/A" : v12, vrm == "" ? "N/A" : vrm }
-        ')"
-        IFS=, read -r BOARD_12V BOARD_VRM <<< "$sensor_values"
-    fi
-
-    gpu_speed="$(read_pci_value "$GPU_SYSFS/current_link_speed")"
-    gpu_width="$(read_pci_value "$GPU_SYSFS/current_link_width")"
-    gpu_cor="$(read_aer_total "$GPU_SYSFS/aer_dev_correctable" TOTAL_ERR_COR)"
-    gpu_nonfatal="$(read_aer_total "$GPU_SYSFS/aer_dev_nonfatal" TOTAL_ERR_NONFATAL)"
-    gpu_fatal="$(read_aer_total "$GPU_SYSFS/aer_dev_fatal" TOTAL_ERR_FATAL)"
-    upstream_speed="$(read_pci_value "$UPSTREAM_SYSFS/current_link_speed")"
-    upstream_width="$(read_pci_value "$UPSTREAM_SYSFS/current_link_width")"
-    upstream_cor="$(read_aer_total "$UPSTREAM_SYSFS/aer_rootport_total_err_cor" TOTAL_ERR_COR)"
-    upstream_nonfatal="$(read_aer_total "$UPSTREAM_SYSFS/aer_rootport_total_err_nonfatal" TOTAL_ERR_NONFATAL)"
-    upstream_fatal="$(read_aer_total "$UPSTREAM_SYSFS/aer_rootport_total_err_fatal" TOTAL_ERR_FATAL)"
-
-    platform_row="$timestamp,$BOARD_12V,$BOARD_VRM,${GPU_BDF:-N/A},$gpu_speed,$gpu_width,$gpu_cor,$gpu_nonfatal,$gpu_fatal,${UPSTREAM_BDF:-N/A},$upstream_speed,$upstream_width,$upstream_cor,$upstream_nonfatal,$upstream_fatal"
-    append_platform_row "$platform_row"
-}
-
-append_kernel_event() {
-    local line="$1" row_bytes
-    if [[ ! -e "$KERNEL_LOG" ]]; then
-        printf '%s\n' '===== GPU / PCIe KERNEL EVENTS =====' > "$KERNEL_LOG"
-    fi
-    row_bytes="$(printf '%s\n' "$line" | wc -c)"
-    row_bytes="${row_bytes//[[:space:]]/}"
-    rotate_file_if_needed "$KERNEL_LOG" '===== GPU / PCIe KERNEL EVENTS =====' "$row_bytes"
-    printf '%s\n' "$line" >> "$KERNEL_LOG"
-}
-
-is_relevant_kernel_event() {
-    local event_text="${1,,}"
-    case "$event_text" in
-        *xid[[:space:]]*|*nvrm:*error*|*nvrm:*failed*|*nvrm:*failure*|*nvrm:*timeout*|*nvrm:*timed.out*|*nvrm:*fault*|*nvrm:*fallen.off*|*nvrm:*reset*|*nvrm:*lost*|*aer:*uncorrected*|*aer:*fatal*|*aer:*non-fatal*|*pcie.bus.error*uncorrected*|*pcie.bus.error*fatal*|*pcieport*link*down*|*pcieport*link*fail*|*pcieport*dpc*contain*|*gpu*reset*|*gpu*fail*|*gpu*fault*|*gpu*error*|*gpu*lost*|*gpu*disconnect*|*nvidia*xid*|*nvidia*error*|*nvidia*failed*|*nvidia*failure*|*nvidia*timeout*|*nvidia*fault*)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-is_storage_relevant_kernel_event() {
-    local event_text="${1,,}"
-    case "$event_text" in
-        *nvme*|*blk_update_request*|*buffer\ i/o\ error*|*i/o\ error*|*device\ offline*|*resetting\ controller*|*controller\ is\ down*|*timeout*|*timed\ out*|*aer:*|*pcie\ bus\ error*|*pcieport*link*down*|*pcieport*link*fail*|*pcieport*dpc*|*attempted\ to\ kill\ init*|*general\ protection\ fault*|*ext4-fs*error*|*xfs*corruption*|*btrfs*error*|*unable\ to\ mount\ root*|*failed\ to\ mount\ root*)
-            return 0
-            ;;
-        *)
-            return 1
-            ;;
-    esac
-}
-
-read_kernel_events() {
-    local event='' timestamp scanned=0 logged=0
-    [[ -n "$KERNEL_FD" ]] || return 0
-    # Bound work per redraw so an NVIDIA error storm cannot freeze the UI.
-    while (( scanned < 1000 && logged < 25 )) && IFS= read -r -t 0 -u "$KERNEL_FD" event; do
-        ((scanned += 1))
-        if is_relevant_kernel_event "$event"; then
-            timestamp="$(date --iso-8601=seconds)"
-            append_kernel_event "[$timestamp] $event"
-            alert_message="GPU/PCIe kernel event at $(date +%H:%M:%S) — details in kernel-events.log"
-            alert_color="$RED"
-            ((logged += 1))
-        fi
-        if is_storage_relevant_kernel_event "$event"; then
-            timestamp="$(date --iso-8601=seconds)"
-            append_storage_event "[$timestamp] [kernel] $event"
-        fi
+check_pstore() {
+    local entry id when count=0
+    [[ -d "$PSTORE_DIR" ]] || return 0
+    for entry in "$PSTORE_DIR"/*/; do
+        id="${entry%/}"
+        id="${id##*/}"
+        grep -qxF -- "$id" "$SEEN_PSTORE" 2>/dev/null && continue
+        printf '%s\n' "$id" >> "$SEEN_PSTORE"
+        when=unknown
+        [[ "$id" =~ ^[0-9]+$ ]] && printf -v when '%(%F %T)T' "$id"
+        log_event panic "kernel panic dump from $when in ${entry%/} (root-only: sudo cat ${entry}*/*)"
+        ((count += 1))
     done
-    return 0
+    (( count == 0 )) || set_alert warn "$count new kernel panic dump(s) in $PSTORE_DIR - see events.log"
 }
 
-capture_nvme_health() {
-    local timestamp controller controller_path pci_path upstream_path bdf upstream_bdf
-    local speed width cor nonfatal fatal upstream_cor upstream_nonfatal upstream_fatal
-    local found=0
-    timestamp="$(date --iso-8601=seconds)"
-    for controller_path in /sys/class/nvme/nvme[0-9]*; do
-        [[ -e "$controller_path" ]] || continue
-        ((found += 1))
-        controller="${controller_path##*/}"
-        pci_path="$(readlink -f -- "$controller_path/device" 2>/dev/null || true)"
-        while [[ -n "$pci_path" && "$pci_path" != / && ! -r "$pci_path/current_link_speed" ]]; do
-            pci_path="$(dirname -- "$pci_path")"
-        done
-        if [[ -n "$pci_path" && -r "$pci_path/current_link_speed" ]]; then
-            bdf="${pci_path##*/}"
-            speed="$(read_pci_value "$pci_path/current_link_speed")"
-            width="$(read_pci_value "$pci_path/current_link_width")"
-            cor="$(read_aer_total "$pci_path/aer_dev_correctable" TOTAL_ERR_COR)"
-            nonfatal="$(read_aer_total "$pci_path/aer_dev_nonfatal" TOTAL_ERR_NONFATAL)"
-            fatal="$(read_aer_total "$pci_path/aer_dev_fatal" TOTAL_ERR_FATAL)"
-            append_storage_event "[$timestamp] [nvme-pcie:$controller] BDF=$bdf speed=$speed width=$width AER(correctable/nonfatal/fatal)=$cor/$nonfatal/$fatal"
-            upstream_path="$(dirname -- "$pci_path")"
-            while [[ "$upstream_path" != / && ! -r "$upstream_path/aer_rootport_total_err_cor" ]]; do
-                upstream_path="$(dirname -- "$upstream_path")"
-            done
-            if [[ -r "$upstream_path/aer_rootport_total_err_cor" ]]; then
-                upstream_bdf="${upstream_path##*/}"
-                upstream_cor="$(read_aer_total "$upstream_path/aer_rootport_total_err_cor" TOTAL_ERR_COR)"
-                upstream_nonfatal="$(read_aer_total "$upstream_path/aer_rootport_total_err_nonfatal" TOTAL_ERR_NONFATAL)"
-                upstream_fatal="$(read_aer_total "$upstream_path/aer_rootport_total_err_fatal" TOTAL_ERR_FATAL)"
-                append_storage_event "[$timestamp] [nvme-upstream:$controller] BDF=$upstream_bdf AER(correctable/nonfatal/fatal)=$upstream_cor/$upstream_nonfatal/$upstream_fatal"
-            fi
-        else
-            append_storage_event "[$timestamp] [nvme-pcie:$controller] PCIe link counters unavailable"
-        fi
-    done
-    if (( found == 0 )); then
-        append_storage_event "[$timestamp] [nvme] No NVMe controllers found under /sys/class/nvme"
-    fi
+# ---------------------------------------------------------------- crash bundles
+
+telemetry_window() { # start-epoch end-epoch -> CSV rows between them
+    local from to
+    printf -v from '%(%FT%T)T' "$1"
+    printf -v to '%(%FT%T)T' "$2"
+    printf '%s\n' "$TELEMETRY_HEADER"
+    awk -F, -v from="$from" -v to="$to" \
+        'FNR > 1 { t = substr($1, 1, 19); if (t >= from && t <= to) print }' \
+        "$TELEMETRY_CSV".{2,1} "$TELEMETRY_CSV" 2>/dev/null
 }
 
-start_nvme_capture() {
-    if [[ -n "$NVME_CAPTURE_PID" ]] && kill -0 "$NVME_CAPTURE_PID" 2>/dev/null; then
+write_summary() { # dir trigger detail boot-id
+    {
+        printf 'Trigger:   %s\n' "$2"
+        printf 'Detail:    %s\n' "$3"
+        printf 'Saved:     %(%F %T %z)T\n' -1
+        printf 'Boot ID:   %s\n' "$4"
+        printf 'System:    %s\n' "$(system_identity)"
+        printf 'GPU:       %s\n' "${GPU_SYSFS##*/}"
+        printf 'Cmdline:   %s\n\n' "$(</proc/cmdline)"
+        printf 'Latest VRAM health snapshot:\n'
+        [[ -s "$HEALTH_CSV" ]] && { head -n 1 -- "$HEALTH_CSV"; tail -n 1 -- "$HEALTH_CSV"; }
+    } > "$1/summary.txt" 2>&1
+}
+
+capture_bundle_kernel() { # dir since-epoch
+    command -v journalctl >/dev/null 2>&1 || return 0
+    journalctl -k -b 0 --since "@$2" -o short-iso-precise --no-pager 2>&1 | tail -n 20000 > "$1/kernel.log"
+}
+
+trigger_bundle() { # trigger detail
+    local dir
+    epoch_now
+    (( EPOCH - LAST_BUNDLE_EPOCH >= BUNDLE_COOLDOWN )) || return 0
+    LAST_BUNDLE_EPOCH="$EPOCH"
+    printf -v dir '%s/%(%Y-%m-%d_%H%M%S)T' "$CRASH_DIR" "$EPOCH"
+    mkdir -p -- "$dir" || return 0
+    printf '%s\n' "$BOOT_ID" > "$dir/boot_id"
+    write_summary "$dir" "$1" "$2" "$BOOT_ID"
+    {
+        printf '%s\n' "$TELEMETRY_HEADER"
+        cat -- "$TELEMETRY_CSV.1" "$TELEMETRY_CSV" 2>/dev/null | grep -v '^timestamp,' | tail -n "$BUNDLE_SAMPLES"
+    } > "$dir/telemetry.csv"
+    write_pci_state "$dir/pci.txt"
+    tail -n 200 -- "$EVENTS_LOG" > "$dir/events.txt" 2>/dev/null
+    capture_bundle_kernel "$dir" "$((EPOCH - BUNDLE_KERNEL_LOOKBACK))"
+    # nvidia-smi can hang on a dead GPU; never let it stall the logger.
+    ( timeout 20s nvidia-smi -q > "$dir/nvidia-smi-q.txt" 2>&1 ) &
+    BUNDLE_DIR="$dir"
+    BUNDLE_EPOCH="$EPOCH"
+    FOLLOWUP_AT=$((EPOCH + FOLLOWUP_DELAY))
+    log_event crash "crash bundle saved to ${dir#"$LOG_DIR/"} ($1)"
+    set_alert bad "GPU failure at $(printf '%(%T)T' "$EPOCH") - bundle ${dir#"$LOG_DIR/"}"
+}
+
+check_previous_boot() {
+    local previous first first_ts first_epoch dir='' f
+    command -v journalctl >/dev/null 2>&1 || return 0
+    previous="$(journalctl -b -1 -n 1 -o export --no-pager 2>/dev/null | sed -n 's/^_BOOT_ID=//p')"
+    [[ -n "$previous" ]] || return 0
+    grep -qxF -- "$previous" "$SEEN_BOOTS" 2>/dev/null && return 0
+    printf '%s\n' "$previous" >> "$SEEN_BOOTS"
+
+    first="$(journalctl -k -b -1 -o short-iso-precise --no-pager 2>/dev/null | grep -a -m1 -E "$TRIGGER_RE")"
+    if [[ -z "$first" ]]; then
+        log_event boot "previous boot ${previous:0:8} shows no GPU failure"
         return 0
     fi
-    capture_nvme_health &
-    NVME_CAPTURE_PID=$!
-}
+    first_ts="${first%% *}"
+    first_epoch="$(date -d "$first_ts" +%s 2>/dev/null)" || first_epoch=0
+    log_event boot "previous boot ${previous:0:8} hit a GPU failure at $first_ts: ${first#* kernel: }"
 
-capture_system_identity() {
-    local timestamp bios_version bios_date board_name
-    timestamp="$(date --iso-8601=seconds)"
-    bios_version="$(cat /sys/class/dmi/id/bios_version 2>/dev/null || true)"
-    bios_date="$(cat /sys/class/dmi/id/bios_date 2>/dev/null || true)"
-    board_name="$(cat /sys/class/dmi/id/board_name 2>/dev/null || true)"
-    append_storage_event "[$timestamp] [system] board=${board_name:-N/A} BIOS=${bios_version:-N/A} BIOS-date=${bios_date:-N/A} kernel=$(uname -r)"
-}
-
-calculate_averages() {
-    printf '%s\n' "${history_metrics[@]}" | awk -F, '
-        {
-            for (i = 1; i <= 5; i++) {
-                if ($i ~ /^-?[0-9]+([.][0-9]+)?$/) {
-                    sum[i] += $i
-                    count[i]++
-                }
-            }
-        }
-        END {
-            for (i = 1; i <= 5; i++) {
-                if (count[i]) printf "%.1f", sum[i] / count[i]
-                else printf "N/A"
-                if (i < 5) printf ","
-            }
-            printf "\n"
-        }
-    '
-}
-
-render_display() {
-    (( DISPLAY_MODE )) || return 0
-    local averages avg_power avg_util avg_temp avg_graphics avg_memory
-    local frame_inner=$((FRAME_WIDTH - 2)) row_count i title='GPU CRASH TELEMETRY'
-    local title_left title_right outer_rule='' table_top_rule='' table_middle_rule='' table_bottom_rule=''
-    local width index alert_line
-    if (( READ_ONLY_VIEW )); then
-        title='GPU TELEMETRY - READ ONLY'
-    fi
-    printf '\033[2J\033[H'
-    printf -v outer_rule '%*s' "$frame_inner" ''
-    outer_rule="${outer_rule// /─}"
-    printf '%s%s╭%s╮%s\n' "$PAD" "$PURPLE" "$outer_rule" "$RESET"
-    title_left=$(((frame_inner - ${#title}) / 2))
-    title_right=$((frame_inner - ${#title} - title_left))
-    printf '%s%s│%s%*s%s%*s%s│%s\n' "$PAD" "$PURPLE" "$RESET" \
-        "$title_left" '' "$title" "$title_right" '' "$PURPLE" "$RESET"
-    printf '%s%s├%s┤%s\n' "$PAD" "$PURPLE" "$outer_rule" "$RESET"
-    frame_line "GPU: ${gpu_name:-Waiting for NVIDIA GPU}" "$CYAN"
-    frame_line "Rolling view: latest $HISTORY_LIMIT samples (~${SAMPLE_INTERVAL}s apart)" "$COMMENT"
-    alert_line="${alert_message:-No GPU/PCIe alerts this run}"
-    frame_line "$alert_line" "${alert_color:-$COMMENT}"
-
-    for index in "${COL_WIDTHS[@]}"; do
-        if [[ -n "$table_top_rule" ]]; then
-            table_top_rule+='┬'
-            table_middle_rule+='┼'
-            table_bottom_rule+='┴'
-        fi
-        printf -v width '%*s' "$index" ''
-        table_top_rule+="${width// /─}"
-        table_middle_rule+="${width// /─}"
-        table_bottom_rule+="${width// /─}"
+    for f in "$CRASH_DIR"/*/boot_id; do
+        [[ "$(<"$f")" == "$previous" ]] && dir="${f%/boot_id}"
     done
-    printf '%s%s├%s┤%s\n' "$PAD" "$PURPLE" "$table_top_rule" "$RESET"
-    render_table_row "$PINK" "${TABLE_HEADERS[@]}"
-    printf '%s%s├%s┤%s\n' "$PAD" "$PURPLE" "$table_middle_rule" "$RESET"
-    row_count=${#history_lines[@]}
-    for ((i = 0; i < HISTORY_LIMIT; i++)); do
-        if (( i < row_count )); then
-            IFS='|' read -r col_time col_state col_power col_gpu col_temp col_vram col_fan col_clocks col_pcie col_12v col_vrm <<< "${history_lines[i]}"
-            render_table_row "$FOREGROUND" \
-                "$col_time" "$col_state" "$col_power" "$col_gpu" "$col_temp" \
-                "$col_vram" "$col_fan" "$col_clocks" "$col_pcie" "$col_12v" "$col_vrm"
+    if [[ -z "$dir" ]]; then
+        # The logger missed it live (it was not running, or the machine froze), so build the bundle now.
+        printf -v dir '%s/%(%Y-%m-%d_%H%M%S)T_previous-boot' "$CRASH_DIR" "$first_epoch"
+        mkdir -p -- "$dir" || return 0
+        printf '%s\n' "$previous" > "$dir/boot_id"
+        write_summary "$dir" 'previous boot (found when the logger started)' "$first" "$previous"
+        telemetry_window "$((first_epoch - 600))" "$((first_epoch + 60))" > "$dir/telemetry.csv"
+        log_event crash "crash bundle saved to ${dir#"$LOG_DIR/"} (previous boot)"
+        set_alert bad "Previous boot ended after a GPU failure - bundle ${dir#"$LOG_DIR/"}"
+    fi
+    journalctl -k -b -1 --since "@$((first_epoch - 300))" -o short-iso-precise --no-pager 2>&1 |
+        head -n 20000 > "$dir/kernel-previous-boot.log"
+}
+
+# ---------------------------------------------------------------- kernel watcher
+
+start_kernel_watcher() {
+    command -v journalctl >/dev/null 2>&1 || {
+        log_event logger 'journalctl not found: kernel messages are not being watched'
+        return 0
+    }
+    coproc KWATCH {
+        journalctl -k -f -n 0 -o short-iso-precise --no-pager 2>/dev/null |
+            grep --line-buffered -a -E "$KERNEL_FILTER"
+    }
+    # Bash unsets the coproc variables when it exits, so keep copies.
+    KWATCH_FD="${KWATCH[0]}"
+    KWATCH_CHILD="$KWATCH_PID"
+}
+
+stop_kernel_watcher() {
+    if [[ -n "$KWATCH_CHILD" ]]; then
+        pkill -P "$KWATCH_CHILD" 2>/dev/null
+        kill "$KWATCH_CHILD" 2>/dev/null
+    fi
+    [[ -z "$KWATCH_FD" ]] || exec {KWATCH_FD}<&-
+    KWATCH_FD=''
+    KWATCH_CHILD=''
+}
+
+handle_kernel_line() { # journal line
+    local line="$1" message key count xid
+    message="${line#* kernel: }"
+    if [[ "$message" =~ Xid\ \([^\)]*\):\ ([0-9]+) ]]; then
+        # Every Xid is kept: they are rare, and the code says what failed.
+        xid="${BASH_REMATCH[1]}"
+        log_event kernel "${line%% *} $message"
+        if [[ "$message" =~ $TRIGGER_RE ]]; then
+            set_alert bad "Xid $xid (GPU failure) at ${line:11:8} - see crash bundle"
         else
-            render_table_row "$FOREGROUND" '' '' '' '' '' '' '' '' '' '' ''
+            set_alert warn "Xid $xid at ${line:11:8} - see events.log"
         fi
-    done
-
-    averages="$(calculate_averages)"
-    IFS=, read -r avg_power avg_util avg_temp avg_graphics avg_memory <<< "$averages"
-    printf '%s%s├%s┤%s\n' "$PAD" "$PURPLE" "$table_bottom_rule" "$RESET"
-    printf -v average_line 'AVG (%2s)  Power %s W  GPU %s%%  Temp %s C  Clocks %s / %s MHz' \
-        "$row_count" "$avg_power" "$avg_util" "$avg_temp" "$avg_graphics" "$avg_memory"
-    frame_line "$average_line" "$GREEN"
-    printf '%s%s╰%s╯%s\n' "$PAD" "$PURPLE" "$outer_rule" "$RESET"
-    if (( READ_ONLY_VIEW )); then
-        printf '%s%sRead-only view of the active logger logs   %sCtrl+C to close%s\n' \
-            "$PAD" "$CYAN" "$COMMENT" "$RESET"
     else
-        printf '%s%sLogs:%s ./logs/ (GPU/PCIe/board/NVMe)   %sRetention:%s %s MiB × %s + 10 MiB storage   %sCtrl+C to stop%s\n' \
-            "$PAD" \
-            "$CYAN" "$RESET" "$CYAN" "$RESET" "$((LOG_MAX_BYTES / 1024 / 1024))" \
-            "$((LOG_ROTATIONS + 1))" \
-            "$COMMENT" "$RESET"
+        key="${message//0x+([[:xdigit:]])/#}"
+        key="${key//+([0-9])/#}"
+        count=$(( ${KERNEL_SEEN["$key"]:-0} + 1 ))
+        KERNEL_SEEN["$key"]="$count"
+        if (( count == 1 )); then
+            log_event kernel "${line%% *} $message"
+        elif (( count % REPEAT_LOG_EVERY == 0 )); then
+            log_event kernel "${line%% *} (seen $count times) $message"
+        fi
     fi
+    [[ "$message" =~ $TRIGGER_RE ]] && trigger_bundle kernel "$message"
 }
 
-frame_line() {
-    local text="$1" color="$2"
-    printf '%s%s│%s %-*.*s %s│%s\n' "$PAD" "$PURPLE" "$color" \
-        "$((FRAME_WIDTH - 4))" "$((FRAME_WIDTH - 4))" "$text" "$PURPLE" "$RESET"
-}
-
-render_table_row() {
-    local cell_color="$1" i value
-    local -a values=()
-    shift
-    values=("$@")
-    printf '%s%s│%s' "$PAD" "$PURPLE" "$cell_color"
-    for ((i = 0; i < ${#COL_WIDTHS[@]}; i++)); do
-        value="${values[i]:-}"
-        printf '%-*.*s' "${COL_WIDTHS[i]}" "${COL_WIDTHS[i]}" "$value"
-        printf '%s│' "$PURPLE"
-        if (( i + 1 < ${#COL_WIDTHS[@]} )); then
-            printf '%s' "$cell_color"
+wait_for_kernel_lines() { # deadline in microseconds; doubles as the sample delay
+    local deadline="$1" remaining secs line
+    while :; do
+        remaining=$(( deadline - ${EPOCHREALTIME/./} ))
+        (( remaining > 0 )) || return 0
+        printf -v secs '%d.%06d' $((remaining / 1000000)) $((remaining % 1000000))
+        if [[ -z "$KWATCH_FD" ]]; then
+            sleep "$secs"
+            return 0
+        fi
+        if IFS= read -r -t "$secs" -u "$KWATCH_FD" line; then
+            handle_kernel_line "$line"
+        elif (( $? <= 128 )); then
+            log_event logger 'kernel watcher stopped; retrying in a minute'
+            stop_kernel_watcher
+            epoch_now
+            KWATCH_RETRY_AT=$((EPOCH + 60))
         fi
     done
-    printf '%s\n' "$RESET"
 }
 
-load_log_snapshot() {
-    local file line status timestamp gpu state power util temp gfx memclock gen width detail
-    local used total fan limit board12 vrm time_short power_display vram_display fan_display
-    local display12 display_vrm escaped_detail
-    local snapshot_rows=$((HISTORY_LIMIT * 3))
-    local -A ext_used=() ext_total=() ext_fan=() ext_limit=() platform_12v=() platform_vrm=()
+# ---------------------------------------------------------------- sampling
 
-    history_lines=()
-    history_metrics=()
-    gpu_name=''
-
-    if [[ -r "$EXTENDED_LOG" ]]; then
-        while IFS=, read -r timestamp used total _ fan limit _ _; do
-            [[ "$timestamp" == timestamp || -z "$timestamp" ]] && continue
-            ext_used["$timestamp"]="$used"
-            ext_total["$timestamp"]="$total"
-            ext_fan["$timestamp"]="$fan"
-            ext_limit["$timestamp"]="$limit"
-        done < <(tail -n "$snapshot_rows" -- "$EXTENDED_LOG")
-    fi
-    if [[ -r "$PLATFORM_LOG" ]]; then
-        while IFS=, read -r timestamp board12 vrm _; do
-            [[ "$timestamp" == timestamp || -z "$timestamp" ]] && continue
-            platform_12v["$timestamp"]="$board12"
-            platform_vrm["$timestamp"]="$vrm"
-        done < <(tail -n "$snapshot_rows" -- "$PLATFORM_LOG")
-    fi
-
-    if [[ -r "$LOG_FILE" ]]; then
-        while IFS=, read -r status timestamp gpu state power util temp gfx memclock gen width detail; do
-            [[ "$status" == status || -z "$status" || "$status" == RUN_START ]] && continue
-            [[ -n "$timestamp" ]] || continue
-            time_short="${timestamp##*T}"
-            time_short="${time_short##* }"
-            time_short="${time_short%%.*}"
-            [[ "$time_short" == *+* ]] && time_short="${time_short%%+*}"
-            [[ "$time_short" == *-* ]] && time_short="${time_short%%-*}"
-            used="${ext_used[$timestamp]:-}"
-            total="${ext_total[$timestamp]:-}"
-            fan="${ext_fan[$timestamp]:-}"
-            limit="${ext_limit[$timestamp]:-}"
-            board12="${platform_12v[$timestamp]:-N/A}"
-            vrm="${platform_vrm[$timestamp]:-N/A}"
-            if [[ "$status" == ERROR ]]; then
-                history_lines+=("$time_short|ERROR|N/A|N/A|N/A|N/A|N/A|N/A|N/A|N/A|N/A")
-                history_metrics+=',,,,'
-                escaped_detail="${detail#\"}"
-                escaped_detail="${escaped_detail%\"}"
-                alert_message="Logged GPU query error at $time_short: ${escaped_detail:0:55}"
-                alert_color="$YELLOW"
-                continue
+take_sample() {
+    local output status i j=0 row detail
+    local -a fields=() values=()
+    output="$(timeout "${QUERY_TIMEOUT}s" nvidia-smi --query-gpu="$QUERY_LIST" \
+        --format=csv,noheader,nounits 2>&1)"
+    status=$?
+    stamp
+    epoch_now
+    IFS=, read -r -a fields <<< "$output"
+    if (( status == 0 )) && [[ "$output" != *$'\n'* ]] && (( ${#fields[@]} >= ${#QUERY_FIELDS[@]} - 2 )); then
+        for i in "${!QUERY_FIELDS[@]}"; do
+            CLEAN=''
+            if (( FIELD_SUPPORTED[i] )); then
+                clean_value "${fields[j]:-}"
+                ((j += 1))
             fi
-
-            gpu_name="$gpu"
-            if [[ "$power" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-                if [[ "$limit" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-                    power_display="${power%%.*}/${limit%%.*}"
-                else
-                    power_display="${power}W"
-                fi
-            else
-                power_display='N/A'
-            fi
-            if [[ -n "$used" && -n "$total" && "$used" != N/A && "$total" != N/A ]]; then
-                vram_display="$used/$total"
-            else
-                vram_display='N/A'
-            fi
-            if [[ "$fan" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-                fan_display="${fan%%.*}%"
-            else
-                fan_display='N/A'
-            fi
-            if [[ "$board12" =~ ^[0-9]+([.][0-9]+)?$ ]]; then display12="${board12}V"; else display12='N/A'; fi
-            if [[ "$vrm" =~ ^[0-9]+([.][0-9]+)?$ ]]; then display_vrm="${vrm}C"; else display_vrm='N/A'; fi
-            history_lines+=("$time_short|$state|$power_display|${util}%|${temp}C|$vram_display|$fan_display|${gfx}/${memclock}|Gen${gen} x${width}|$display12|$display_vrm")
-            history_metrics+=("$power,$util,$temp,$gfx,$memclock")
-        done < <(tail -n "$snapshot_rows" -- "$LOG_FILE")
+            values+=("$CLEAN")
+        done
+        row="$NOW,OK,$(IFS=,; printf '%s' "${values[*]}"),"
+        printf '%s\n' "$row" >> "$TELEMETRY_CSV"
+        SAMPLE_FAILS=0
+        if (( GPU_LOST )); then
+            GPU_LOST=0
+            log_event gpu 'GPU is answering again'
+            set_alert warn "GPU answered again at ${NOW:11:8} after a failure - bundle ${BUNDLE_DIR#"$LOG_DIR/"}"
+        fi
+        return 0
     fi
 
-    if (( ${#history_lines[@]} > HISTORY_LIMIT )); then
-        history_lines=("${history_lines[@]: -HISTORY_LIMIT}")
-        history_metrics=("${history_metrics[@]: -HISTORY_LIMIT}")
+    detail="${output//[$'\r\n']/ }"
+    detail="${detail//\"/\'}"
+    ((SAMPLE_FAILS += 1))
+    if (( SAMPLE_FAILS >= 2 && ! GPU_LOST )); then
+        GPU_LOST=1
+        log_event gpu "GPU stopped answering: $detail"
+        trigger_bundle nvidia-smi "$detail"
     fi
-    if [[ -z "$alert_message" ]]; then
-        alert_message='Read-only view: active logger owns data'
-        alert_color="$CYAN"
+    if (( SAMPLE_FAILS == 1 || EPOCH - LAST_LOST_ROW >= LOST_ROW_INTERVAL )); then
+        printf '%s,LOST%s"%s"\n' "$NOW" ',,,,,,,,,,,,,,,,' "$detail" >> "$TELEMETRY_CSV"
+        LAST_LOST_ROW="$EPOCH"
     fi
 }
 
-run_log_viewer() {
-    READ_ONLY_VIEW=1
-    while :; do
-        alert_message=''
-        load_log_snapshot
-        render_display
-        sleep "$SAMPLE_INTERVAL"
+periodic_tasks() {
+    epoch_now
+    if (( EPOCH >= NEXT_MINUTE )); then
+        NEXT_MINUTE=$((EPOCH + 60))
+        rotate_if_needed "$TELEMETRY_CSV" "$TELEMETRY_MAX_BYTES" "$TELEMETRY_ROTATIONS" "$TELEMETRY_HEADER"
+        rotate_if_needed "$EVENTS_LOG" "$EVENTS_MAX_BYTES" "$EVENTS_ROTATIONS"
+        check_pstore
+    fi
+    if (( ! GPU_LOST && EPOCH >= NEXT_HEALTH )); then
+        NEXT_HEALTH=$((EPOCH + HEALTH_INTERVAL))
+        take_health_snapshot hourly
+    fi
+    if (( FOLLOWUP_AT && EPOCH >= FOLLOWUP_AT )); then
+        FOLLOWUP_AT=0
+        capture_bundle_kernel "$BUNDLE_DIR" "$((BUNDLE_EPOCH - BUNDLE_KERNEL_LOOKBACK))"
+        write_pci_state "$BUNDLE_DIR/pci-after.txt"
+    fi
+    if [[ -z "$KWATCH_FD" ]] && (( KWATCH_RETRY_AT && EPOCH >= KWATCH_RETRY_AT )); then
+        KWATCH_RETRY_AT=0
+        start_kernel_watcher
+    fi
+}
+
+# ---------------------------------------------------------------- dashboard
+
+COL_WIDTHS=(8 5 7 4 4 11 4 10 6)
+COL_HEADERS=(TIME STATE PWR/LIM GPU% TEMP 'VRAM MiB' FAN% GFX/MEM PCIe LIMITS)
+LAST_COL=$((FRAME_WIDTH - 2 - ${#COL_WIDTHS[@]}))
+for width in "${COL_WIDTHS[@]}"; do ((LAST_COL -= width)); done
+COL_WIDTHS+=("$LAST_COL")
+PAD='  '
+FRAME=''
+
+or_dash() { printf -v "$1" '%s' "${2:--}"; }
+
+decode_reasons() { # hex bitmask -> REASONS
+    local value
+    local -a names=()
+    REASONS=-
+    [[ "$1" =~ ^0x[[:xdigit:]]+$ ]] || return 0
+    value=$((16#${1#0x}))
+    (( value & 0x1 )) && names+=(idle)
+    (( value & 0x2 )) && names+=(app-clocks)
+    (( value & 0x4 )) && names+=(sw-power)
+    (( value & 0x8 )) && names+=(hw-slowdown)
+    (( value & 0x20 )) && names+=(sw-thermal)
+    (( value & 0x40 )) && names+=(hw-thermal)
+    (( value & 0x80 )) && names+=(power-brake)
+    REASONS="${names[*]:-none}"
+}
+
+frame_add() { FRAME+="$PAD$1$RESET"$'\e[K\n'; }
+
+frame_text() { # text color
+    local line
+    printf -v line '%s│%s %-*.*s %s│' "$PURPLE" "$2" $((FRAME_WIDTH - 4)) $((FRAME_WIDTH - 4)) "$1" "$PURPLE"
+    frame_add "$line"
+}
+
+frame_rule() { # left middle right [joint]
+    local rule='' width piece
+    for width in "${COL_WIDTHS[@]}"; do
+        printf -v piece '%*s' "$width" ''
+        [[ -z "$rule" ]] || rule+="${4:-─}"
+        rule+="${piece// /─}"
     done
+    frame_add "$PURPLE$1$rule$3"
 }
 
-history_lines=()
-history_metrics=()
-gpu_name=''
-BOARD_12V='N/A'
-BOARD_VRM='N/A'
-alert_message=''
-alert_color="$COMMENT"
-query_fields=(timestamp name pstate power.draw utilization.gpu temperature.gpu clocks.current.graphics clocks.current.memory pcie.link.gen.current pcie.link.width.current)
-query_fields+=("${OPTIONAL_FIELDS[@]}")
-QUERY_LIST="$(IFS=,; printf '%s' "${query_fields[*]}")"
+frame_cells() { # color cells...
+    local color="$1" line i
+    local -a cells=("${@:2}")
+    line="$PURPLE│$color"
+    for i in "${!COL_WIDTHS[@]}"; do
+        printf -v line '%s%-*.*s%s│%s' "$line" "${COL_WIDTHS[i]}" "${COL_WIDTHS[i]}" "${cells[i]:-}" "$PURPLE" "$color"
+    done
+    frame_add "$line"
+}
+
+render() {
+    (( DISPLAY_MODE )) || return 0
+    local inner=$((FRAME_WIDTH - 2)) rule title health_color='' health_text alert_level=ok alert_text=''
+    local row ts status pstate pw pl gu _mu t _mt gfx mem gen width vu vt fan reasons detail
+    local _hts hboot _hreason hname hdriver hvbios hecc _hpersist hrc hru hrp hrf
+    local c_pwr c_gpu c_temp c_vram c_fan c_clk c_pcie i
+    local -a rows=() bundles=("$CRASH_DIR"/*/)
+
+    mapfile -t rows < <(tail -n "$HISTORY_LIMIT" -- "$TELEMETRY_CSV" 2>/dev/null | grep -v '^timestamp,')
+    IFS=, read -r _hts hboot _hreason hname hdriver hvbios hecc _hpersist hrc hru hrp hrf _ \
+        < <(tail -n 1 -- "$HEALTH_CSV" 2>/dev/null | grep -v '^timestamp,')
+    [[ -r "$ALERT_FILE" ]] && IFS='|' read -r alert_level alert_text < "$ALERT_FILE"
+
+    FRAME=$'\e[H'
+    printf -v rule '%*s' "$inner" ''
+    rule="${rule// /─}"
+    title='GPU CRASH TELEMETRY'
+    (( LOGGER_OWNER )) || title='GPU CRASH TELEMETRY - READ ONLY'
+    frame_add "$PURPLE╭$rule╮"
+    printf -v row '%*s%s' $(((inner - 2 - ${#title}) / 2)) '' "$title"
+    frame_text "$row" "$PINK"
+    frame_add "$PURPLE├$rule┤"
+    frame_text "GPU: ${hname:-waiting for first health snapshot}  driver ${hdriver:-?}  vbios ${hvbios:-?}  boot ${hboot:0:8}" "$CYAN"
+
+    if [[ "$hru" =~ ^[0-9]+$ ]]; then
+        health_text="VRAM remapped rows: $hru uncorrectable, $hrc correctable, pending $hrp, failed $hrf, ECC $hecc"
+        health_color="$GREEN"
+        (( hru > 0 || hrc > 0 )) && health_color="$YELLOW"
+        [[ "$hrp" == Yes || "$hrf" == Yes ]] && health_color="$RED"
+    else
+        health_text='VRAM remapped rows: not read yet'
+        health_color="$COMMENT"
+    fi
+    frame_text "$health_text" "$health_color"
+    case "$alert_level" in
+        bad) frame_text "$alert_text" "$RED" ;;
+        warn) frame_text "$alert_text" "$YELLOW" ;;
+        *) frame_text "${alert_text:-No GPU failures seen by this logger}" "$COMMENT" ;;
+    esac
+
+    frame_rule '├' '' '┤' '┬'
+    frame_cells "$PINK" "${COL_HEADERS[@]}"
+    frame_rule '├' '' '┤' '┼'
+    for ((i = 0; i < HISTORY_LIMIT; i++)); do
+        row="${rows[i]:-}"
+        if [[ -z "$row" ]]; then
+            frame_cells "$FOREGROUND"
+            continue
+        fi
+        IFS=, read -r ts status pstate pw pl gu _mu t _mt gfx mem gen width vu vt fan reasons detail <<< "$row"
+        if [[ "$status" == LOST ]]; then
+            detail="${detail#\"}"
+            frame_cells "$RED" "${ts:11:8}" LOST - - - - - - - "${detail%\"}"
+            continue
+        fi
+        or_dash c_pwr "${pw:+${pw%%.*}/${pl%%.*}}"
+        or_dash c_gpu "${gu:+$gu%}"
+        or_dash c_temp "${t:+${t}C}"
+        or_dash c_vram "${vu:+$vu/$vt}"
+        or_dash c_fan "${fan:+$fan%}"
+        or_dash c_clk "${gfx:+$gfx/$mem}"
+        or_dash c_pcie "${gen:+G${gen}x$width}"
+        decode_reasons "$reasons"
+        frame_cells "$FOREGROUND" "${ts:11:8}" "${pstate:--}" "$c_pwr" "$c_gpu" "$c_temp" \
+            "$c_vram" "$c_fan" "$c_clk" "$c_pcie" "$REASONS"
+    done
+    frame_rule '├' '' '┤' '┴'
+
+    if (( ${#bundles[@]} )); then
+        row="${bundles[-1]%/}"
+        row="Crash bundles: ${#bundles[@]} (latest ${row##*/})"
+    else
+        row='Crash bundles: none yet'
+    fi
+    frame_text "$row   Logs: ${LOG_DIR/#"$HOME"/\~}" "$FOREGROUND"
+    frame_add "$PURPLE╰$rule╯"
+    if (( LOGGER_OWNER )); then
+        frame_add "$COMMENT  Sampling every ${SAMPLE_INTERVAL}s. Ctrl+C to stop logging."
+    else
+        frame_add "$COMMENT  Showing the running logger's data. Ctrl+C to close."
+    fi
+    printf '%s\e[J' "$FRAME"
+}
+
+# ---------------------------------------------------------------- main
 
 cleanup() {
-    if [[ -n "$KERNEL_JOURNAL_PID" ]]; then
-        kill "$KERNEL_JOURNAL_PID" 2>/dev/null || true
-    fi
-    if [[ -n "$NVME_CAPTURE_PID" ]]; then
-        kill "$NVME_CAPTURE_PID" 2>/dev/null || true
-        wait "$NVME_CAPTURE_PID" 2>/dev/null || true
-    fi
-    if [[ -n "$KERNEL_FD" ]]; then
-        exec {KERNEL_FD}<&-
-    fi
-    if (( DISPLAY_MODE )); then
-        printf '\033[?25h%s\n' "$RESET"
-    fi
+    stop_kernel_watcher
+    (( LOGGER_OWNER )) && log_event logger 'stopped'
+    (( DISPLAY_MODE )) && printf '\e[?25h\e[?1049l'
 }
-trap cleanup EXIT
-trap 'exit 130' INT TERM
 
 if (( ! LOGGER_OWNER )); then
-    if (( DISPLAY_MODE )); then
-        run_log_viewer
-    else
-        printf 'GPU telemetry logger is already running; existing logs were left untouched.\n'
+    if (( ! DISPLAY_MODE )); then
+        printf 'A telemetry logger is already running; nothing to do.\n'
+        exit 0
     fi
-    exit 0
+    trap 'printf "\e[?25h\e[?1049l"' EXIT
+    trap 'exit 130' INT TERM
+    printf '\e[?1049h\e[?25l\e[2J'
+    while :; do
+        render
+        sleep "$SAMPLE_INTERVAL"
+    done
 fi
 
-if ! command -v nvidia-smi >/dev/null 2>&1; then
-    printf 'Error: nvidia-smi was not found.\n' >&2
-    exit 1
-fi
+command -v nvidia-smi >/dev/null 2>&1 || { printf 'Error: nvidia-smi was not found.\n' >&2; exit 1; }
+[[ -s "$TELEMETRY_CSV" ]] || printf '%s\n' "$TELEMETRY_HEADER" > "$TELEMETRY_CSV"
+trap cleanup EXIT
+trap 'exit 130' INT TERM
+(( DISPLAY_MODE )) && printf '\e[?1049h\e[?25l\e[2J'
 
-[[ -s "$LOG_FILE" ]] || printf '%s\n' "$CSV_HEADER" > "$LOG_FILE"
-[[ -s "$EXTENDED_LOG" ]] || printf '%s\n' "$EXTENDED_HEADER" > "$EXTENDED_LOG"
-[[ -s "$PLATFORM_LOG" ]] || printf '%s\n' "$PLATFORM_HEADER" > "$PLATFORM_LOG"
+find_gpu
+detect_query_fields
+log_event logger "started pid=$$ $(system_identity) gpu=${GPU_SYSFS##*/}"
+set_alert ok ''
+take_health_snapshot startup
+check_pstore
+check_previous_boot
+start_kernel_watcher
+render
 
-if (( DISPLAY_MODE )); then
-    printf '\033[?25l'
-fi
-
-run_started_at="$(date --iso-8601=seconds)"
-run_marker="RUN_START,$run_started_at,,,,,,,,,,\"===== NEW RUN =====\""
-append_log_row "$run_marker"
-append_extended_row "$run_started_at,,,,,,,"
-append_kernel_event "[$run_started_at] ===== NEW RUN ====="
-capture_platform_metrics "$run_started_at"
-# Draw immediately so startup history collection never looks like a no-op.
-render_display
-if command -v journalctl >/dev/null 2>&1; then
-    previous_event_count=0
-    previous_event_limit=50
-    previous_line_count=0
-    previous_line_limit=2000
-    while IFS= read -r previous_event; do
-        ((previous_line_count += 1))
-        if is_relevant_kernel_event "$previous_event"; then
-            append_kernel_event "[previous boot] $previous_event"
-            alert_message="Previous boot GPU/PCIe events found — details in kernel-events.log"
-            alert_color="$YELLOW"
-            ((previous_event_count += 1))
-            if (( previous_event_count >= previous_event_limit )); then
-                break
-            fi
-        fi
-        if is_storage_relevant_kernel_event "$previous_event"; then
-            append_storage_event "[previous boot] [kernel] $previous_event"
-        fi
-        if (( previous_line_count >= previous_line_limit )); then
-            break
-        fi
-    done < <(journalctl -k -b -1 -p warning -n 100 -r --no-pager -o short-iso-precise 2>/dev/null || true)
-
-    coproc KERNEL_JOURNAL {
-        journalctl -k -f -p warning -n 0 --no-pager -o short-iso-precise 2>/dev/null
-    }
-    KERNEL_FD="${KERNEL_JOURNAL[0]}"
-    KERNEL_JOURNAL_PID="${KERNEL_JOURNAL_PID:-}"
-fi
-capture_system_identity
-start_nvme_capture
-LAST_STORAGE_CAPTURE="$(date +%s)"
-render_display
-
+epoch_now
+NEXT_MINUTE=$((EPOCH + 60))
+NEXT_HEALTH=$((EPOCH + HEALTH_INTERVAL))
+deadline=${EPOCHREALTIME/./}
 while :; do
-    if sample="$(timeout "${QUERY_TIMEOUT}s" nvidia-smi \
-        --query-gpu="$QUERY_LIST" \
-        --format=csv,noheader,nounits 2>&1)"; then
-        sample="${sample//$'\r'/ }"
-        sample="${sample//$'\n'/ }"
-        IFS=, read -r -a sample_fields <<< "$sample"
-        sample_time="${sample_fields[0]:-}"
-        sample_gpu="${sample_fields[1]:-}"
-        sample_state="${sample_fields[2]:-}"
-        sample_power="${sample_fields[3]:-}"
-        sample_util="${sample_fields[4]:-}"
-        sample_temp="${sample_fields[5]:-}"
-        sample_graphics="${sample_fields[6]:-}"
-        sample_memory="${sample_fields[7]:-}"
-        sample_gen="${sample_fields[8]:-}"
-        sample_width="${sample_fields[9]:-}"
-        sample_time="$(trim "$sample_time")"
-        gpu_name="$(trim "$sample_gpu")"
-        sample_state="$(trim "$sample_state")"
-        sample_power="$(trim "$sample_power")"
-        sample_util="$(trim "$sample_util")"
-        sample_temp="$(trim "$sample_temp")"
-        sample_graphics="$(trim "$sample_graphics")"
-        sample_memory="$(trim "$sample_memory")"
-        sample_gen="$(trim "$sample_gen")"
-        sample_width="$(trim "$sample_width")"
-
-        display_time="${sample_time##* }"
-        display_time="${display_time%%.*}"
-        log_row="DATA,$sample_time,$gpu_name,$sample_state,$sample_power,$sample_util,$sample_temp,$sample_graphics,$sample_memory,$sample_gen,$sample_width,"
-        declare -A optional_values=()
-        for ((field_index = 0; field_index < ${#OPTIONAL_FIELDS[@]}; field_index++)); do
-            optional_value="$(trim "${sample_fields[10 + field_index]:-}")"
-            optional_values["${OPTIONAL_FIELDS[field_index]}"]="$optional_value"
-        done
-        sample_limit="${optional_values[power.limit]:-}"
-        sample_vram_used="${optional_values[memory.used]:-}"
-        sample_vram_total="${optional_values[memory.total]:-}"
-        sample_fan="${optional_values[fan.speed]:-N/A}"
-        if [[ "$sample_power" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-            if awk -v value="$sample_power" 'BEGIN { exit !(value >= 100) }'; then
-                printf -v power_draw_short '%.0f' "$sample_power"
-            else
-                printf -v power_draw_short '%.1f' "$sample_power"
-            fi
-            if [[ "$sample_limit" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-                power_display="$power_draw_short/${sample_limit%%.*}"
-            else
-                power_display="${power_draw_short}W"
-            fi
-        else
-            power_display='N/A'
-        fi
-        if [[ -n "$sample_vram_used" && "$sample_vram_used" != N/A && -n "$sample_vram_total" && "$sample_vram_total" != N/A ]]; then
-            vram_display="$sample_vram_used/$sample_vram_total"
-        else
-            vram_display='N/A'
-        fi
-        if [[ "$sample_fan" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-            fan_display="${sample_fan%%.*}%"
-        else
-            fan_display='N/A'
-        fi
-        capture_platform_metrics "$sample_time"
-        if [[ "$BOARD_12V" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-            display_12v="${BOARD_12V}V"
-        else
-            display_12v='N/A'
-        fi
-        if [[ "$BOARD_VRM" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-            display_vrm="${BOARD_VRM}C"
-        else
-            display_vrm='N/A'
-        fi
-        history_lines+=("$display_time|$sample_state|$power_display|${sample_util}%|${sample_temp}C|$vram_display|$fan_display|${sample_graphics}/${sample_memory}|Gen${sample_gen} x${sample_width}|$display_12v|$display_vrm")
-        history_metrics+=("$sample_power,$sample_util,$sample_temp,$sample_graphics,$sample_memory")
-        ext_row="$sample_time"
-        for field in memory.used memory.total temperature.memory fan.speed power.limit pcie.rx_throughput pcie.tx_throughput; do
-            ext_value="${optional_values[$field]:-}"
-            ext_row+=",$ext_value"
-        done
-        append_extended_row "$ext_row"
-        alert_message=''
-        alert_color="$COMMENT"
-    else
-        error_text="${sample//$'\r'/ }"
-        error_text="${error_text//$'\n'/ }"
-        escaped_error="${error_text//\"/\"\"}"
-        sample_time="$(date --iso-8601=seconds)"
-        display_time="$(date '+%H:%M:%S')"
-        capture_platform_metrics "$sample_time"
-        if [[ "$BOARD_12V" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-            display_12v="${BOARD_12V}V"
-        else
-            display_12v='N/A'
-        fi
-        if [[ "$BOARD_VRM" =~ ^[0-9]+([.][0-9]+)?$ ]]; then
-            display_vrm="${BOARD_VRM}C"
-        else
-            display_vrm='N/A'
-        fi
-        history_lines+=("$display_time|ERROR|N/A|N/A|N/A|N/A|N/A|N/A|N/A|$display_12v|$display_vrm")
-        history_metrics+=',,,,'
-        log_row="ERROR,$sample_time,,,,,,,,,,\"$escaped_error\""
-        alert_message="GPU query failed at $display_time — details in gpu-telemetry.csv"
-        alert_color="$YELLOW"
-    fi
-
-    read_kernel_events
-    current_epoch="$(date +%s)"
-    if (( current_epoch - LAST_STORAGE_CAPTURE >= 60 )); then
-        start_nvme_capture
-        LAST_STORAGE_CAPTURE="$current_epoch"
-    fi
-
-    if (( ${#history_lines[@]} > HISTORY_LIMIT )); then
-        history_lines=("${history_lines[@]:1}")
-        history_metrics=("${history_metrics[@]:1}")
-    fi
-
-    append_log_row "$log_row"
-    render_display
-    sleep "$SAMPLE_INTERVAL"
+    take_sample
+    periodic_tasks
+    render
+    deadline=$((deadline + SAMPLE_INTERVAL * 1000000))
+    # After a long stall (suspend, a hung nvidia-smi), restart the schedule instead of catching up.
+    (( deadline > ${EPOCHREALTIME/./} )) || deadline=$(( ${EPOCHREALTIME/./} + SAMPLE_INTERVAL * 1000000 ))
+    wait_for_kernel_lines "$deadline"
 done
