@@ -33,8 +33,9 @@ If the logger misses a failure live (it was not running, or the machine froze), 
 | File | Purpose |
 | --- | --- |
 | `system-telemetry.sh` | The logger and dashboard |
-| `install-service.sh` | Generates the unit from the template and installs, enables and restarts it |
-| `system-telemetry.service.in` | Unit template; `@USER@`, `@HOME@` and `@INSTALL_DIR@` are filled in by the installer |
+| `crash-reboot.py` | Root key listener for the Super + Alt + Delete emergency reboot |
+| `install-service.sh` | Generates both units from their templates and installs, enables and restarts them |
+| `system-telemetry.service.in`, `crash-reboot.service.in` | Unit templates; `@USER@`, `@HOME@` and `@INSTALL_DIR@` are filled in by the installer |
 
 ## Run
 
@@ -52,7 +53,7 @@ Run without the dashboard (used by the service):
 ./system-telemetry.sh --headless
 ```
 
-Install it as a system service for the current user and checkout path:
+Install the logger and the emergency-reboot listener as system services for the current user and checkout path:
 
 ```bash
 ./install-service.sh
@@ -73,9 +74,28 @@ SystemMaxUse=1G
 
 Then restart journald with `sudo systemctl restart systemd-journald`.
 
+## Emergency reboot: hold Super + Alt + Delete
+
+When the GPU drops off the bus the screen goes black, but Linux keeps running. Holding the power button skips the clean shutdown and can damage the filesystem. Instead, hold **Super + Alt + Delete for 3 seconds**:
+
+1. Caps Lock blinks three times to confirm.
+2. The kernel log is saved into this boot's crash bundle as `kernel-at-reboot.log`.
+3. Disks are synced and the machine reboots cleanly.
+4. If the clean reboot hangs for 45 seconds (unloading the NVIDIA driver can block on a dead GPU), it is forced through `/proc/sysrq-trigger`: sync, remount read-only, reboot.
+
+`crash-reboot.py` runs as root in `crash-reboot.service` and reads keyboards straight from the kernel, so it works even when the desktop has died with the GPU. A KDE shortcut would not: KWin runs on the GPU. It only watches for the combo and never grabs, remaps or records keys. It needs `python-evdev`.
+
+Test it without rebooting; this saves the log and blinks Caps Lock, then keeps listening:
+
+```bash
+sudo systemctl stop crash-reboot
+sudo python3 -I crash-reboot.py --dry-run
+sudo systemctl start crash-reboot
+```
+
 ## After a crash
 
-1. Reboot and let the service start; it adds the previous boot's kernel log to the bundle.
+1. Reboot with Super + Alt + Delete and let the service start; it adds the previous boot's kernel log to the bundle.
 2. Run `sudo nvidia-bug-report.sh` and keep the archive with the bundle.
 3. Compare the newest row of `logs/health.csv` with older rows to see whether remapped rows went up.
 

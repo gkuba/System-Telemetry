@@ -1,0 +1,16 @@
+[Unit]
+Description=Super+Alt+Delete emergency reboot for GPU crashes
+# No default dependencies: shutdown must not stop this service, so its forced
+# reboot fallback still runs if the clean reboot hangs.
+DefaultDependencies=no
+After=local-fs.target systemd-udevd.service
+
+[Service]
+Type=simple
+Environment="TELEMETRY_LOG_DIR=@INSTALL_DIR@/logs"
+ExecStart=/usr/bin/python3 -I "@INSTALL_DIR@/crash-reboot.py"
+Restart=always
+RestartSec=2
+
+[Install]
+WantedBy=multi-user.target
