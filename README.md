@@ -27,6 +27,7 @@ If the logger misses a failure live (it was not running, or the machine froze), 
 - Bash 5 and an NVIDIA GPU with the NVIDIA driver (`nvidia-smi`)
 - coreutils (`timeout`, `stat`), util-linux (`flock`), procps (`pkill`), and `journalctl`
 - Read access to the kernel journal: the service gets it through the `systemd-journal` group
+- Python 3 with `python-evdev` for the emergency-reboot listener (`sudo pacman -S python-evdev`); the installer checks for it
 
 ## Files
 
@@ -59,9 +60,9 @@ Install the logger and the emergency-reboot listener as system services for the 
 ./install-service.sh
 ```
 
-The installer asks for sudo, writes the unit to `/etc/systemd/system/`, and enables and restarts it. The unit runs the script from this checkout, so run the installer again whenever the folder moves or is renamed.
+The installer asks for sudo, writes both units to `/etc/systemd/system/`, and enables and restarts them. The units run the scripts from this checkout, so run the installer again whenever the folder moves or is renamed.
 
-Check on the service with `systemctl status system-telemetry` and `journalctl -u system-telemetry`.
+Check on the services with `systemctl status system-telemetry crash-reboot` and `journalctl -u system-telemetry`.
 
 ## Keep the journal
 
@@ -83,7 +84,7 @@ When the GPU drops off the bus the screen goes black, but Linux keeps running. H
 3. Disks are synced and the machine reboots cleanly.
 4. If the clean reboot hangs for 45 seconds (unloading the NVIDIA driver can block on a dead GPU), it is forced through `/proc/sysrq-trigger`: sync, remount read-only, reboot.
 
-`crash-reboot.py` runs as root in `crash-reboot.service` and reads keyboards straight from the kernel, so it works even when the desktop has died with the GPU. A KDE shortcut would not: KWin runs on the GPU. It only watches for the combo and never grabs, remaps or records keys. It needs `python-evdev`.
+`crash-reboot.py` runs as root in `crash-reboot.service` and reads keyboards straight from the kernel, so it works even when the desktop has died with the GPU. A KDE shortcut would not: KWin runs on the GPU. It only watches for the combo and never grabs, remaps or records keys.
 
 Test it without rebooting; this saves the log and blinks Caps Lock, then keeps listening:
 
